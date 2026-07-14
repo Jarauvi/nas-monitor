@@ -20,7 +20,7 @@
 #endif
 #include <sys/select.h>
 #include "MQTTClient.h"
-
+#include <time.h>
 
 
 #define CONFIG_PATH "/etc/nas-monitor.conf"
@@ -139,7 +139,18 @@ typedef struct {
     int mqtt_enabled;
     int ha_discovery_enabled;
     int fan_control_enabled;
+
+    // Spindown behavior enable (actual hdparm standby cycle)
     int spindown_enabled;
+
+    // MQTT / Home Assistant button visibility enable (per requirements)
+    int mqtt_btn_mode_rw_enabled;
+    int mqtt_btn_mode_ro_enabled;
+    int mqtt_btn_reboot_enabled;
+    int mqtt_btn_shutdown_enabled;
+    int mqtt_btn_sleep_enabled;
+    // Single enable/disable to show ALL spindown buttons
+    int mqtt_btn_spindown_enabled;
 
     // LED module
     int led_control_enabled;
@@ -179,6 +190,17 @@ typedef struct {
     int fan_pwm; // New metric
 } NASMetrics;
 
+typedef struct {
+    char device_path[64];
+    unsigned long last_io_sectors;
+    time_t last_active_time;
+    int initialized;
+    int is_spun_down; // Prevent sending redundant standby commands
+} SoftwareSpindownTracker;
+
+// Array to hold the state of tracked drives
+static SoftwareSpindownTracker spindown_trackers[MAX_SPINDOWN_DRIVES];
+
 // Ring buffer to keep track of running temperatures
 #define TEMP_SAMPLES 5
 static int temp_history[TEMP_SAMPLES] = {0};
@@ -212,6 +234,17 @@ int load_config(const char *filename, NASConfig *config) {
     config->ha_discovery_enabled = 1;
     config->fan_control_enabled = 0;
     config->spindown_enabled = 1;
+
+    // MQTT button visibility defaults (keep previous behavior)
+    config->mqtt_btn_mode_rw_enabled = 1;
+    config->mqtt_btn_mode_ro_enabled = 1;
+    config->mqtt_btn_reboot_enabled = 1;
+    config->mqtt_btn_shutdown_enabled = 1;
+    config->mqtt_btn_sleep_enabled = 1;
+
+    // Single enable/disable to show ALL spindown buttons
+    config->mqtt_btn_spindown_enabled = 1;
+
 
     // LED module defaults
     config->led_control_enabled = 0;
@@ -285,7 +318,16 @@ int load_config(const char *filename, NASConfig *config) {
             else if (strcmp(key, "fan_control_enabled") == 0) config->fan_control_enabled = atoi(value);
             else if (strcmp(key, "spindown_enabled") == 0) config->spindown_enabled = atoi(value);
 
+            // MQTT button visibility enable flags
+            else if (strcmp(key, "mqtt_btn_mode_rw_enabled") == 0) config->mqtt_btn_mode_rw_enabled = atoi(value);
+            else if (strcmp(key, "mqtt_btn_mode_ro_enabled") == 0) config->mqtt_btn_mode_ro_enabled = atoi(value);
+            else if (strcmp(key, "mqtt_btn_reboot_enabled") == 0) config->mqtt_btn_reboot_enabled = atoi(value);
+            else if (strcmp(key, "mqtt_btn_shutdown_enabled") == 0) config->mqtt_btn_shutdown_enabled = atoi(value);
+            else if (strcmp(key, "mqtt_btn_sleep_enabled") == 0) config->mqtt_btn_sleep_enabled = atoi(value);
+            else if (strcmp(key, "mqtt_btn_spindown_enabled") == 0) config->mqtt_btn_spindown_enabled = atoi(value);
+
             else if (strcmp(key, "led_control_enabled") == 0) config->led_control_enabled = atoi(value);
+
             else if (strcmp(key, "leds_count") == 0) config->leds_count = atoi(value);
 
             // Per-LED config (led_name_1..led_name_N, purpose_1..)
@@ -491,6 +533,110 @@ int run_fan_control_cycle(const NASConfig *cfg, int last_pwm) {
         app_debug("fan-control: Temperature %d C -> PWM %d", cur_temp, next_pwm);
     }
     return next_pwm;
+}
+
+static long long get_disk_total_sectors(const char *device_path) {
+    const char *dev_name = device_path;
+    if (strncmp(dev_name, "/dev/", 5) == 0) {
+        dev_name += 5; // e.g., "/dev/sda" -> "sda"
+    }
+
+    FILE *fp = fopen("/proc/diskstats", "r");
+    if (!fp) return -1;
+
+    char line[256];
+    unsigned int major, minor;
+    char name[32];
+    unsigned long reads_completed, reads_merged, sectors_read, time_reading;
+    unsigned long writes_completed, writes_merged, sectors_written;
+    int found = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        int parsed = sscanf(line, "%u %u %31s %lu %lu %lu %lu %lu %lu %lu",
+                            &major, &minor, name,
+                            &reads_completed, &reads_merged, &sectors_read, &time_reading,
+                            &writes_completed, &writes_merged, &sectors_written);
+        
+        if (parsed >= 10 && strcmp(name, dev_name) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(fp);
+
+    if (!found) return -1;
+
+    return (long long)(sectors_read + sectors_written);
+}
+
+void handle_software_spindown_cycle(const NASConfig *cfg) {
+    if (!cfg->spindown_enabled) return;
+
+    time_t now = time(NULL);
+
+    for (int i = 0; i < cfg->spindown_drive_count; i++) {
+        const char *drive = cfg->spindown_drive[i];
+        int timeout_sec = cfg->spindown_timeout[i];
+
+        if (timeout_sec <= 0) continue; // Spindown disabled for this drive
+
+        SoftwareSpindownTracker *tracker = &spindown_trackers[i];
+
+        // 1. Initialize tracker on first run
+        if (!tracker->initialized) {
+            strncpy(tracker->device_path, drive, sizeof(tracker->device_path) - 1);
+            long long sectors = get_disk_total_sectors(drive);
+            if (sectors >= 0) {
+                tracker->last_io_sectors = (unsigned long)sectors;
+                tracker->last_active_time = now;
+                tracker->is_spun_down = 0;
+                tracker->initialized = 1;
+                app_debug("Spindown tracker initialized for %s. Timeout: %d sec.", drive, timeout_sec);
+            }
+            continue;
+        }
+
+        // 2. Read current sectors
+        long long current_sectors = get_disk_total_sectors(drive);
+        if (current_sectors < 0) {
+            // Error reading stats, skip this cycle to avoid false triggers
+            continue;
+        }
+
+        // 3. Check for I/O activity
+        if ((unsigned long)current_sectors != tracker->last_io_sectors) {
+            // Activity detected! Reset the idle timer.
+            tracker->last_io_sectors = (unsigned long)current_sectors;
+            tracker->last_active_time = now;
+
+            if (tracker->is_spun_down) {
+                app_debug("Activity detected on %s! Drive woke up naturally.", drive);
+                tracker->is_spun_down = 0;
+            }
+        } else {
+            // No activity. Check if the idle period exceeds the timeout.
+            int idle_duration = (int)(now - tracker->last_active_time);
+
+            if (idle_duration >= timeout_sec) {
+                if (!tracker->is_spun_down) {
+                    syslog(LOG_INFO, "Drive %s idle for %d seconds. Sending standby command.", drive, idle_duration);
+                    app_debug("Drive %s idle for %d seconds. Sending standby command.", drive, idle_duration);
+                    
+                    // Issue immediate standby/spin-down command safely
+                    char cmd[128];
+                    snprintf(cmd, sizeof(cmd), "/sbin/hdparm -y %s", drive);
+                    run_command(cmd);
+
+                    tracker->is_spun_down = 1;
+                }
+            } else {
+                // Optional debug logging to track countdown
+                if (!tracker->is_spun_down && cfg->debug_enabled) {
+                    app_debug("Drive %s is quiet. Spindown in %d seconds.", drive, timeout_sec - idle_duration);
+                }
+            }
+        }
+    }
 }
 
 int get_drive_power_state(const char *device_path) {
@@ -710,7 +856,7 @@ void publish(MQTTClient client, char* topic, char* payload, int retain) {
 
 const char* device_json = ",\"dev\":{\"ids\":[\"nas_monitor_01\"],\"name\":\"NAS Monitor\",\"mdl\":\"CS-WV Custom NAS\",\"mf\":\"Buildroot Linux\"}";
 
-void send_discovery_configs(MQTTClient client, int fan_enabled) {
+void send_discovery_configs(MQTTClient client, const NASConfig *cfg, int fan_enabled) {
     char topic[256];
     char payload[1024];
 
@@ -770,34 +916,56 @@ void send_discovery_configs(MQTTClient client, int fan_enabled) {
     publish(client, topic, payload, 1);
 
     // --- BUTTONS DISCOVERY ---
-    snprintf(topic, sizeof(topic), "%s_mode_rw/config", BUTTON_PREFIX);
-    snprintf(payload, sizeof(payload), "{\"name\":\"NAS Mode Read-Write\",\"cmd_t\":\"%smode_rw\",\"uniq_id\":\"nas_btn_mode_rw\"%s}", CMD_TOPIC_BASE, device_json);
-    publish(client, topic, payload, 1);
+    if (cfg->mqtt_btn_mode_rw_enabled) {
+        snprintf(topic, sizeof(topic), "%s_mode_rw/config", BUTTON_PREFIX);
+        snprintf(payload, sizeof(payload), "{\"name\":\"NAS Mode Read-Write\",\"cmd_t\":\"%smode_rw\",\"uniq_id\":\"nas_btn_mode_rw\"%s}", CMD_TOPIC_BASE, device_json);
+        publish(client, topic, payload, 1);
+    }
 
-    snprintf(topic, sizeof(topic), "%s_mode_ro/config", BUTTON_PREFIX);
-    snprintf(payload, sizeof(payload), "{\"name\":\"NAS Mode Read-Only\",\"cmd_t\":\"%smode_ro\",\"uniq_id\":\"nas_btn_mode_ro\"%s}", CMD_TOPIC_BASE, device_json);
-    publish(client, topic, payload, 1);
+    if (cfg->mqtt_btn_mode_ro_enabled) {
+        snprintf(topic, sizeof(topic), "%s_mode_ro/config", BUTTON_PREFIX);
+        snprintf(payload, sizeof(payload), "{\"name\":\"NAS Mode Read-Only\",\"cmd_t\":\"%smode_ro\",\"uniq_id\":\"nas_btn_mode_ro\"%s}", CMD_TOPIC_BASE, device_json);
+        publish(client, topic, payload, 1);
+    }
 
-    snprintf(topic, sizeof(topic), "%s_sda_spin/config", BUTTON_PREFIX);
-    snprintf(payload, sizeof(payload), "{\"name\":\"NAS Spin Down sda\",\"cmd_t\":\"%ssda_spin\",\"uniq_id\":\"nas_btn_sda_spin\"%s}", CMD_TOPIC_BASE, device_json);
-    publish(client, topic, payload, 1);
+    if (cfg->mqtt_btn_reboot_enabled) {
+        snprintf(topic, sizeof(topic), "%s_reboot/config", BUTTON_PREFIX);
+        snprintf(payload, sizeof(payload), "{\"name\":\"NAS Reboot System\",\"cmd_t\":\"%sreboot\",\"uniq_id\":\"nas_btn_reboot\",\"device_class\":\"restart\"%s}", CMD_TOPIC_BASE, device_json);
+        publish(client, topic, payload, 1);
+    }
 
-    snprintf(topic, sizeof(topic), "%s_sdb_spin/config", BUTTON_PREFIX);
-    snprintf(payload, sizeof(payload), "{\"name\":\"NAS Spin Down sdb\",\"cmd_t\":\"%ssdb_spin\",\"uniq_id\":\"nas_btn_sdb_spin\"%s}", CMD_TOPIC_BASE, device_json);
-    publish(client, topic, payload, 1);  
+    if (cfg->mqtt_btn_shutdown_enabled) {
+        snprintf(topic, sizeof(topic), "%s_shutdown/config", BUTTON_PREFIX);
+        snprintf(payload, sizeof(payload), "{\"name\":\"NAS Shutdown System\",\"cmd_t\":\"%sshutdown\",\"uniq_id\":\"nas_btn_shutdown\"%s}", CMD_TOPIC_BASE, device_json);
+        publish(client, topic, payload, 1);
+    }
 
-    snprintf(topic, sizeof(topic), "%s_reboot/config", BUTTON_PREFIX);
-    snprintf(payload, sizeof(payload), "{\"name\":\"NAS Reboot System\",\"cmd_t\":\"%sreboot\",\"uniq_id\":\"nas_btn_reboot\",\"device_class\":\"restart\"%s}", CMD_TOPIC_BASE, device_json);
-    publish(client, topic, payload, 1);
+    if (cfg->mqtt_btn_sleep_enabled) {
+        snprintf(topic, sizeof(topic), "%s_sleep/config", BUTTON_PREFIX);
+        snprintf(payload, sizeof(payload), "{\"name\":\"NAS Suspend System\",\"cmd_t\":\"%ssleep\",\"uniq_id\":\"nas_btn_sleep\"%s}", CMD_TOPIC_BASE, device_json);
+        publish(client, topic, payload, 1);
+    }
 
-    snprintf(topic, sizeof(topic), "%s_shutdown/config", BUTTON_PREFIX);
-    snprintf(payload, sizeof(payload), "{\"name\":\"NAS Shutdown System\",\"cmd_t\":\"%sshutdown\",\"uniq_id\":\"nas_btn_shutdown\"%s}", CMD_TOPIC_BASE, device_json);
-    publish(client, topic, payload, 1);
+    if (cfg->mqtt_btn_spindown_enabled) {
+        for (int i = 0; i < cfg->spindown_drive_count; i++) {
+            const char *drive = cfg->spindown_drive[i];
+            int timeout_sec = cfg->spindown_timeout[i];
+            if (timeout_sec <= 0) continue;
+            if (!drive || drive[0] == '\0') continue;
 
-    snprintf(topic, sizeof(topic), "%s_sleep/config", BUTTON_PREFIX);
-    snprintf(payload, sizeof(payload), "{\"name\":\"NAS Suspend System\",\"cmd_t\":\"%ssleep\",\"uniq_id\":\"nas_btn_sleep\"%s}", CMD_TOPIC_BASE, device_json);
-    publish(client, topic, payload, 1);
+            // Extract token from /dev/sda -> sda (also supports already-token strings)
+            const char *token = drive;
+            if (strncmp(token, "/dev/", 5) == 0) token += 5;
+
+            snprintf(topic, sizeof(topic), "%s_%s_spin/config", BUTTON_PREFIX, token);
+            snprintf(payload, sizeof(payload),
+                     "{\"name\":\"NAS Spin Down %s\",\"cmd_t\":\"%s%s_spin\",\"uniq_id\":\"nas_btn_%s_spin\"%s}",
+                     token, CMD_TOPIC_BASE, token, token, device_json);
+            publish(client, topic, payload, 1);
+        }
+    }
 }
+
 
 static int read_drive_standby(const char *device_path) {
     return get_drive_power_state(device_path);
@@ -1004,8 +1172,6 @@ static void run_led_control_cycle(const NASConfig *cfg, const NASMetrics *metric
             continue;
         }
 
-        /* Unconditional stderr log to verify the write call executes */
-        fprintf(stderr, "LED WRITE CALL: %s -> %d\n", l->led_name, val);
         int wrote = write_led_brightness(cfg, l->led_name, val);
         if (wrote) {
             last_led_brightness[i] = val;
@@ -1033,10 +1199,32 @@ int message_arrived(void *context, char *topicName, int topicLen, MQTTClient_mes
         run_command("mount -o remount,rw / 2>/dev/null || btrfs property set / ro false 2>/dev/null");
     } else if (strstr(topicName, "mode_ro")) {
         run_command("mount -o remount,ro / 2>/dev/null || btrfs property set / ro true 2>/dev/null");
-    } else if (strstr(topicName, "sda_spin")) {
-        run_command("hdparm -y /dev/sda");
-    } else if (strstr(topicName, "sdb_spin")) {
-        run_command("hdparm -y /dev/sdb");
+    } else if (strstr(topicName, "_spin")) {
+        // Expected tokens in command name: <token>_spin where token is like sda/sdb
+        // We support tokens defined in config spindown_drive[] to map them to real /dev paths.
+        // Since we don't have cfg here, accept both /dev/sdX and sdX tokens.
+        // If token is sdX -> use /dev/sdX.
+
+        // Find token between last '/' and suffix '_spin'
+        const char *last_slash = strrchr(topicName, '/');
+        const char *spin_pos = strstr(topicName, "_spin");
+        if (last_slash && spin_pos && spin_pos > last_slash) {
+            char token[64] = {0};
+            size_t tok_len = (size_t)(spin_pos - last_slash - 1);
+            if (tok_len > 0 && tok_len < sizeof(token)) {
+                memcpy(token, last_slash + 1, tok_len);
+                token[tok_len] = '\0';
+
+                char cmd[128];
+                if (strncmp(token, "/dev/", 5) == 0) {
+                    // token already a device path
+                    snprintf(cmd, sizeof(cmd), "hdparm -y %s", token);
+                } else {
+                    snprintf(cmd, sizeof(cmd), "hdparm -y /dev/%s", token);
+                }
+                run_command(cmd);
+            }
+        }
     } else if (strstr(topicName, "reboot")) {
         run_command("reboot");
     } else if (strstr(topicName, "shutdown")) {
@@ -1057,6 +1245,7 @@ int main() {
     NASMetrics metrics = {0};
 
     if (!load_config(CONFIG_PATH, &config)) {
+
         syslog(LOG_ERR, "Configuration file %s missing or unreadable. Exiting.", CONFIG_PATH);
         closelog();
         return EXIT_FAILURE;
@@ -1098,7 +1287,7 @@ int main() {
 
         if (config.ha_discovery_enabled) {
             int fan_sensor_available = config.fan_control_enabled || (read_pwm(&config) >= 0);
-            send_discovery_configs(client, fan_sensor_available);
+            send_discovery_configs(client, &config, fan_sensor_available);
         }
         MQTTClient_subscribe(client, "nas/monitor/command/#", 1);
         mqtt_ready = 1;
@@ -1108,8 +1297,6 @@ int main() {
 
     int spindown_idle_sec[MAX_SPINDOWN_DRIVES] = {0};
     const int loop_interval_sec = 30;
-
-
 
     while (1) {
         // 1. Optional Fan control cycle (runs every 30s)
@@ -1123,31 +1310,7 @@ int main() {
         // 2a. Optional Power-switch monitoring (may shutdown)
         run_power_switch_monitor_cycle(&config);
 
-        // 2b. Optional Spindown logic
-        if (config.spindown_enabled) {
-            for (int i = 0; i < config.spindown_drive_count && i < MAX_SPINDOWN_DRIVES; i++) {
-                const char *drive = config.spindown_drive[i];
-                int timeout = config.spindown_timeout[i];
-                if (timeout <= 0 || drive[0] == '\0') {
-                    spindown_idle_sec[i] = 0;
-                    continue;
-                }
-
-                int active = get_drive_power_state(drive);
-                if (active == 1) {
-                    spindown_idle_sec[i] += loop_interval_sec;
-                    if (spindown_idle_sec[i] >= timeout) {
-                        app_debug("%s idle timeout reached (%ds). Spinning down.", drive, spindown_idle_sec[i]);
-                        char cmd[128];
-                        snprintf(cmd, sizeof(cmd), "hdparm -y %s", drive);
-                        (void)run_command(cmd);
-                        spindown_idle_sec[i] = 0;
-                    }
-                } else {
-                    spindown_idle_sec[i] = 0;
-                }
-            }
-        }
+        handle_software_spindown_cycle(&config);
 
         // 3. Optional LED control
         if (config.led_control_enabled) {

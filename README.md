@@ -5,6 +5,10 @@
 
 `nas-monitor` is a lightweight, Buildroot-native monitoring and control daemon designed specifically for DIY NAS-style systems. It gathers essential system metrics, manages fan PWM curves, monitors drive standby/spindown states, controls status LEDs via sysfs, integrates with Home Assistant via MQTT, and responds dynamically to physical power-switch events.
 
+This is my attempt to create all-in-one package for handling functionalities for my Buffalo CS-WV setup. This project started only for lowering the power consumption and noise by switching off disks when they are not needed and keeping the fan noise at minimum. But idea led to another and now there is a bunch of useful features implemented.
+
+There is nothing device specific, only dependency is paho-mqtt-c package
+
 ## ✨ Features
 
 * **📊 Metrics & Integration:** Publish runtime metrics to MQTT with automatic Home Assistant MQTT Discovery.
@@ -22,7 +26,7 @@ Follow these steps to integrate `nas-monitor` into your custom Buildroot tree:
 
 ### 1. Clone to packages
 
-Clone or move the repo to buildroot-xxxx.xx.x/package
+Clone or move the repo to buildroot-xxxx.xx.x/package/
 
 ### 2. Register the Package
 
@@ -45,11 +49,13 @@ make menuconfig
 # Navigate to and select:
 # Target packages -> System tools -> [*] nas-monitor
 
-# Compile only the daemon package for moving to the existing system (still needs paho-mqtt-c)
+# Compile the whole image to include the package with dependencies
+make
+
+# ...Or compile only the daemon package for moving to the existing system (still needs existing paho-mqtt-c binaries)
 make nas-monitor
 
-# Or compile the whole image to include the package with dependencies
-make
+
 ```
 
 > ℹ️ **Note:** The compilation process installs the target binary at `/usr/bin/nas-monitor` and deploys a default template configuration file to `/etc/nas-monitor.conf`.
@@ -87,6 +93,24 @@ username=mqtt_user
 password=secret
 storage_mount=/mnt/storage
 
+# ----------------------------------------------------------------------------
+# Home Assistant MQTT buttons visibility (optional)
+# - Individual buttons can be enabled/disabled.
+# - Spindown buttons are generated for every configured drive.
+#   Use mqtt_btn_spindown_enabled to show/hide all of them at once.
+# ----------------------------------------------------------------------------
+# Per-button enable/disable for non-spindown buttons
+# rw and ro buttons for toggling file system between read-write/read-only
+# make sure you have defined all the necessary paths to be written to tmpfs before activating
+mqtt_btn_mode_rw_enabled=1
+mqtt_btn_mode_ro_enabled=1
+mqtt_btn_reboot_enabled=1
+mqtt_btn_shutdown_enabled=1
+mqtt_btn_sleep_enabled=1
+
+# Single enable/disable to show ALL spindown buttons
+mqtt_btn_spindown_enabled=1
+
 # ==============================================================================
 # Drive Spindown Management
 # When drive is idle for certain time, spindown the disk
@@ -122,6 +146,7 @@ power_switch_input_device=/dev/input/event0
 power_sw_code=0
 auto_sw_code=1
 off_shutdown_delay_sec=2
+
 
 led_control_enabled=0
 leds_count=1
