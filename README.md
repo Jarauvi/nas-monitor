@@ -147,10 +147,6 @@ power_sw_code=0
 auto_sw_code=1
 off_shutdown_delay_sec=2
 
-
-led_control_enabled=0
-leds_count=1
-
 # ===============================================================================
 # LED control
 # Supported purposes: standby, temp_limit, disk_almost_full
@@ -158,6 +154,9 @@ leds_count=1
 # temp_limit = if certain temperature threshold is reached
 # disk_almost_full = if certain block capacity is over x % 
 # ===============================================================================
+
+led_control_enabled=0
+leds_count=1
 
 # LED #1 example: standby indication
 # The standby logic uses on_value when the drive is in standby and off_value when active.
