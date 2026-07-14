@@ -1,0 +1,10 @@
+config BR2_PACKAGE_NAS_MONITOR
+	bool "nas-monitor"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	select BR2_PACKAGE_PAHO_MQTT_C
+	help
+	  Lightweight C daemon that reports system health, storage,
+	  and drive standby states to Home Assistant via MQTT.
+
+comment "nas-monitor needs a toolchain w/ threads"
+	depends on !BR2_TOOLCHAIN_HAS_THREADS
