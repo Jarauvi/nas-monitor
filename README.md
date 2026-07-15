@@ -9,6 +9,11 @@ This is my attempt to create all-in-one package for handling functionalities for
 
 There is nothing device specific, only dependency is paho-mqtt-c package. Optionally, if smartd and smartctl are present the status of the checks and the latest result are sent in mqtt as well. 
 
+<div align="center">
+  <img src="https://github.com/Jarauvi/nas-monitor/blob/main/images/controls.png?raw=true" width="128" height="128">
+  <img src="https://github.com/Jarauvi/nas-monitor/blob/main/images/sensors.png?raw=true" width="128" height="128">
+</div>
+
 ## ✨ Features
 
 * **📊 Metrics & Integration:** Publish runtime metrics to MQTT with automatic Home Assistant MQTT Discovery.
