@@ -7,7 +7,7 @@
 
 This is my attempt to create all-in-one package for handling functionalities for my Buffalo CS-WV setup. This project started only for lowering the power consumption and noise by switching off disks when they are not needed and keeping the fan noise at minimum. But idea led to another and now there is a bunch of useful features implemented.
 
-There is nothing device specific, only dependency is paho-mqtt-c package
+There is nothing device specific, only dependency is paho-mqtt-c package. Optionally, if smartd and smartctl are present the status of the checks and the latest result are sent in mqtt as well. 
 
 ## ✨ Features
 
