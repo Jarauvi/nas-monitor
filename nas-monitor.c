@@ -28,6 +28,7 @@
 #define DISCOVERY_PREFIX "homeassistant/sensor/nas_monitor"
 #define BUTTON_PREFIX "homeassistant/button/nas_monitor"
 #define CMD_TOPIC_BASE "nas/monitor/command/"
+#define MAX_CUSTOM_BUTTONS 9
 
 static int debug_enabled = 0;
 
@@ -120,6 +121,13 @@ typedef struct {
 } LedConfig;
 
 typedef struct {
+    int enabled;
+    char name[64];
+    char icon[32];
+    char command[256];
+} CustomButton;
+
+typedef struct {
     char mqtt_address[256];
     char client_id[128];
     char username[128];
@@ -172,6 +180,10 @@ typedef struct {
     int fan_crit_temp;
     int fan_min_pwm;
     int fan_max_pwm;
+
+    // Custom buttons
+    int custom_button_count;
+    CustomButton custom_buttons[MAX_CUSTOM_BUTTONS];
 } NASConfig;
 
 typedef struct {
@@ -275,7 +287,6 @@ int load_config(const char *filename, NASConfig *config) {
     config->power_sw_code = 0;
     config->auto_sw_code = 1;
     config->off_shutdown_delay_sec = 2;
-
 
     FILE *fp = fopen(filename, "r");
     if (!fp) return 0;
@@ -394,6 +405,20 @@ int load_config(const char *filename, NASConfig *config) {
             else if (strcmp(key, "auto_sw_code") == 0) config->auto_sw_code = atoi(value);
             else if (strcmp(key, "off_shutdown_delay_sec") == 0) config->off_shutdown_delay_sec = atoi(value);
 
+            // Custom buttons
+            else if (strncmp(key, "btn_name_", 9) == 0) {
+                int idx = atoi(key + 9);
+                if (idx >= 1 && idx <= MAX_CUSTOM_BUTTONS) {
+                    strncpy(config->custom_buttons[idx-1].name, value, 64);
+                    config->custom_buttons[idx-1].enabled = 1;
+                }
+            }
+            else if (strncmp(key, "btn_cmd_", 8) == 0) {
+                int idx = atoi(key + 8);
+                if (idx >= 1 && idx <= MAX_CUSTOM_BUTTONS) {
+                    strncpy(config->custom_buttons[idx-1].command, value, 256);
+                }
+            }
         }
 
     }
@@ -861,6 +886,18 @@ void send_discovery_configs(MQTTClient client, const NASConfig *cfg, int fan_ena
     char payload[1024];
 
     // --- SENSORS DISCOVERY ---
+    snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/nas_monitor/status/config");
+    snprintf(payload, sizeof(payload), 
+        "{\"name\":\"NAS Monitor Status\","
+        "\"stat_t\":\"nas/monitor/status\","
+        "\"pl_on\":\"online\","
+        "\"pl_off\":\"offline\","
+        "\"dev_cla\":\"connectivity\","
+        "\"uniq_id\":\"nas_monitor_status\"%s}", 
+        device_json);
+
+    publish(client, topic, payload, 1);
+
     snprintf(topic, sizeof(topic), "%s_cpu/config", DISCOVERY_PREFIX);
     snprintf(payload, sizeof(payload), "{\"name\":\"NAS CPU Usage\",\"stat_t\":\"%s\",\"val_tpl\":\"{{ value_json.cpu | round(1) }}\",\"unit_of_meas\":\"%%\",\"uniq_id\":\"nas_cpu_pct\"%s}", STATE_TOPIC, device_json);
     publish(client, topic, payload, 1);
@@ -870,7 +907,7 @@ void send_discovery_configs(MQTTClient client, const NASConfig *cfg, int fan_ena
     publish(client, topic, payload, 1);
 
     snprintf(topic, sizeof(topic), "%s_load/config", DISCOVERY_PREFIX);
-    snprintf(payload, sizeof(payload), "{\"name\":\"NAS CPU Load 1m\",\"stat_t\":\"%s\",\"val_tpl\":\"{{ value_json.load | round(2) }}\",\"uniq_id\":\"nas_cpu_load1m\"%s}", STATE_TOPIC, device_json);
+    snprintf(payload, sizeof(payload), "{\"name\":\"NAS CPU Load 1m\",\"stat_t\":\"%s\",\"val_tpl\":\"{{ value_json.load | round(2) }}\",\"stat_cla\":\"measurement\",\"uniq_id\":\"nas_cpu_load1m\"%s}", STATE_TOPIC, device_json);
     publish(client, topic, payload, 1);
 
     snprintf(topic, sizeof(topic), "%s_ram/config", DISCOVERY_PREFIX);
@@ -886,7 +923,7 @@ void send_discovery_configs(MQTTClient client, const NASConfig *cfg, int fan_ena
     publish(client, topic, payload, 1);
 
     snprintf(topic, sizeof(topic), "%s_uptime/config", DISCOVERY_PREFIX);
-    snprintf(payload, sizeof(payload), "{\"name\":\"NAS Uptime\",\"stat_t\":\"%s\",\"val_tpl\":\"{{ value_json.uptime }}\",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\",\"uniq_id\":\"nas_uptime_seconds\"%s}", STATE_TOPIC, device_json);
+    snprintf(payload, sizeof(payload), "{\"name\":\"NAS Uptime\",\"stat_t\":\"%s\",\"val_tpl\":\"{{ value_json.uptime }}\",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\", \"stat_cla\":\"measurement\", \"uniq_id\":\"nas_uptime_seconds\"%s}", STATE_TOPIC, device_json);
     publish(client, topic, payload, 1);
 
     snprintf(topic, sizeof(topic), "%s_fs_mode/config", DISCOVERY_PREFIX);
@@ -1184,6 +1221,7 @@ int message_arrived(void *context, char *topicName, int topicLen, MQTTClient_mes
     (void)context;
     (void)topicLen;
 
+    NASConfig *cfg = (NASConfig *)context;
     char* payload = (char*)message->payload;
     int len = message->payloadlen;
 
@@ -1231,11 +1269,37 @@ int message_arrived(void *context, char *topicName, int topicLen, MQTTClient_mes
         run_command("poweroff");
     } else if (strstr(topicName, "sleep")) {
         run_command("systemctl suspend 2>/dev/null || echo mem > /sys/power/state");
+    } else if (strstr(topicName, "custom_button")) {
+        char *last_slash = strrchr(topicName, '/');
+        if (last_slash != NULL) {
+            int btn_idx = atoi(last_slash + 1) - 1; 
+            
+            if (btn_idx >= 0 && btn_idx < MAX_CUSTOM_BUTTONS) {
+                run_command(cfg->custom_buttons[btn_idx].command);
+            } else {
+            }
+        }
     }
 
     MQTTClient_freeMessage(&message);
     MQTTClient_free(topicName);
     return 1;  
+}
+
+void send_custom_button_discovery(MQTTClient client, const NASConfig *cfg) {
+    for (int i = 0; i < MAX_CUSTOM_BUTTONS; i++) {
+        if (!cfg->custom_buttons[i].enabled) continue;
+
+        char topic[256];
+        char payload[512];
+        int idx = i + 1;
+        snprintf(topic, sizeof(topic), "homeassistant/button/nas_monitor/custom_button%d/config", idx);
+        snprintf(payload, sizeof(payload), 
+            "{\"name\":\"%s\",\"cmd_t\":\"nas/monitor/command/custom_button/%d\",\"uniq_id\":\"nas_btn_%d\"%s}", 
+            cfg->custom_buttons[i].name, idx, idx, device_json);
+        
+        publish(client, topic, payload, 1);
+    }
 }
 
 int main() {
@@ -1267,8 +1331,15 @@ int main() {
     int mqtt_ready = 0;
     if (config.mqtt_enabled) {
         MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+        MQTTClient_willOptions will_opts = MQTTClient_willOptions_initializer;
 
         MQTTClient_create(&client, config.mqtt_address, config.client_id, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+        will_opts.topicName = "nas/monitor/status";
+        will_opts.message = "offline";
+        will_opts.retained = 1;
+        will_opts.qos = 1;
+
+        conn_opts.will = &will_opts;
         conn_opts.keepAliveInterval = 60;
         conn_opts.cleansession = 1;
 
@@ -1277,18 +1348,23 @@ int main() {
             conn_opts.password = config.password;
         }
 
-        MQTTClient_setCallbacks(client, NULL, NULL, message_arrived, NULL);
+        MQTTClient_setCallbacks(client, &config, NULL, message_arrived, NULL);
 
         if (MQTTClient_connect(client, &conn_opts) != MQTTCLIENT_SUCCESS) {
             syslog(LOG_ERR, "Failed to connect to MQTT broker at %s", config.mqtt_address);
             closelog();
             return EXIT_FAILURE;
+        } else {
+            publish(client, "nas/monitor/status", "online", 1);
         }
 
         if (config.ha_discovery_enabled) {
             int fan_sensor_available = config.fan_control_enabled || (read_pwm(&config) >= 0);
             send_discovery_configs(client, &config, fan_sensor_available);
+            send_custom_button_discovery(client, &config);
         }
+
+
         MQTTClient_subscribe(client, "nas/monitor/command/#", 1);
         mqtt_ready = 1;
     } else {

@@ -17,6 +17,7 @@ There is nothing device specific, only dependency is paho-mqtt-c package. Option
 ## ✨ Features
 
 * **📊 Metrics & Integration:** Publish runtime metrics to MQTT with automatic Home Assistant MQTT Discovery.
+* **⌨️ Custom Commands:** Define scripts to be executed over MQTT buttons
 * **📈 System Health:** Real-time monitoring of CPU, memory, disk utilization, and filesystem status.
 * **💾 Storage Care:** Smart drive power/standby detection and automated, configurable disk spindown.
 * **💨 Active Cooling:** Intelligent PWM fan control dynamically mapped to CPU/SoC temperatures.
@@ -115,6 +116,16 @@ mqtt_btn_sleep_enabled=1
 
 # Single enable/disable to show ALL spindown buttons
 mqtt_btn_spindown_enabled=1
+
+# ==============================================================================
+# Custom Commands
+# Define custom commands to be executed by MQTT button presses
+# ==============================================================================
+#btn_name_1=Trigger Manual Backup
+#btn_cmd_1=/usr/bin/backup.sh
+
+#btn_name_2=Hello World
+#btn_cmd_2=touch /home/user/helloworld
 
 # ==============================================================================
 # Drive Spindown Management
