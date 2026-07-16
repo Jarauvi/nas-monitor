@@ -121,11 +121,11 @@ mqtt_btn_spindown_enabled=1
 # Custom Commands
 # Define custom commands to be executed by MQTT button presses
 # ==============================================================================
-#btn_name_1=Trigger Manual Backup
-#btn_cmd_1=/usr/bin/backup.sh
+btn_name_1=Trigger Manual Backup
+btn_cmd_1=/usr/bin/backup.sh
 
-#btn_name_2=Hello World
-#btn_cmd_2=touch /home/user/helloworld
+btn_name_2=Hello World
+btn_cmd_2=touch /home/user/helloworld
 
 # ==============================================================================
 # Drive Spindown Management
